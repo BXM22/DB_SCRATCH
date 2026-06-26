@@ -58,18 +58,24 @@ class Page:
 
     @property
     def payload(self) -> memoryview:
-        # TODO(phase-1): return a memoryview over bytes after the header
-        raise NotImplementedError
+        return memoryview(self._data[PAGE_HEADER_SIZE:])
+    
 
     def to_bytes(self) -> bytes:
-        # TODO(phase-1): write header into _data, return full page bytes
-        raise NotImplementedError
+        self._data[:PAGE_HEADER_SIZE] = self.header.pack()
+        return bytes(self._data)
 
     def load_bytes(self, raw: bytes) -> None:
         # TODO(phase-1): validate length, copy into _data, refresh header
-        raise NotImplementedError
+        if len(raw) != self.page_size:
+            raise ValueError("Invalid page size")
+        self._data[:] = raw
+        self.header = PageHeader.unpack(memoryview(self._data[:PAGE_HEADER_SIZE]))
 
     @classmethod
     def from_bytes(cls, page_id: int, raw: bytes) -> Page:
         # TODO(phase-1): construct Page and call load_bytes
-        raise NotImplementedError
+        page = cls(page_id)
+        page.load_bytes(raw)
+        return page
+        
