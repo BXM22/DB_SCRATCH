@@ -1,0 +1,460 @@
+DB_SCRATCH — Implementation Checklist
+======================================
+
+Senior-level implementation guide. Work phases in order; each phase establishes
+invariants the next phase depends on. Un-skip matching tests in
+tests/test_smoke.py as you complete tasks.
+
+  pytest -rs    # show remaining skipped tests
+
+Every task has:
+  WHAT  — what to implement
+  WHY   — why it exists in a real database (the systems reason)
+
+
+PRE-WRITTEN (read, do not reimplement)
+--------------------------------------
+  sql/ast.py         — AST node types (contract for parser output)
+  sql/planner.py     — PlanNode dataclasses (contract for planner output)
+  database.py        — Subsystem wiring; execute() pipeline
+  cli/main.py        — CLI surface
+
+  WHY: These define interfaces between layers. Implementing them yourself
+  would blur the boundary between "compiler front-end" and "storage engine."
+
+
+GLOBAL INVARIANTS (must hold after every phase)
+-----------------------------------------------
+  I1. Page I/O is always page_size bytes (default 4096).
+  I2. Buffer pool never evicts a pinned page.
+  I3. WAL LSN is monotonically increasing (byte offset at append).
+  I4. A page is only considered recovered when record.lsn > page.header.lsn.
+  I5. commit() does not return before WAL fsync completes.
+  I6. B+tree leaf keys remain sorted after every insert/delete.
+
+
+================================================================================
+PHASE 1 — STORAGE
+Establishes the addressable unit (page) and the I/O path to disk.
+
+WHY THIS PHASE: Databases do not read/write arbitrary byte offsets on disk.
+They read pages. Everything upstream — indexes, logs, recovery — assumes a
+stable page abstraction. Get this wrong and every later phase is built on sand.
+================================================================================
+
+File: storage/page.py
+---------------------
+
+[ ] PageHeader.pack()
+    WHAT: Serialize header with struct.pack(PAGE_HEADER_FORMAT, ...).
+          Format: "!BBHIH6x" — type, flags, page_id, lsn, free_space, 6-byte pad.
+    WHY:  The header is how a page identifies itself on disk after a crash.
+          Without a fixed binary layout, recovery cannot tell a B+tree leaf from
+          garbage bytes. Production DBs use the same idea (Postgres page headers).
+    INVARIANT: packed size == PAGE_HEADER_SIZE (16).
+
+[ ] PageHeader.unpack(data: memoryview)
+    WHAT: Inverse of pack. Cast first byte to PageType enum.
+    WHY:  Every page read from disk must be interpreted before use. unpack is
+          the gatekeeper — wrong parsing here means silent corruption later.
+    FAIL: raise ValueError on truncated input, not partial reads.
+
+[ ] Page.payload (property)
+    WHAT: memoryview over _data[PAGE_HEADER_SIZE:].
+    WHY:  B+tree cells live in the payload, not the header. Separating them lets
+          index code mutate keys/values without accidentally overwriting lsn or
+          page_type — a common bug in hand-rolled page stores.
+    INVARIANT: payload size == page_size - PAGE_HEADER_SIZE.
+
+[ ] Page.to_bytes()
+    WHAT: Write header into _data prefix, return bytes(_data).
+    WHY:  flush_page and WAL both need a single canonical byte image of a page.
+          to_bytes is the serialization boundary between memory and disk.
+    INVARIANT: len(result) == page_size.
+
+[ ] Page.load_bytes(raw)
+    WHAT: Assert len(raw) == page_size. Copy into _data. Refresh header via unpack.
+    WHY:  WAL redo replays page images after crash. load_bytes must replace the
+          entire page atomically — partial updates would leave torn pages.
+    INVARIANT: idempotent — loading the same bytes twice yields the same page.
+
+[ ] Page.from_bytes(page_id, raw)
+    WHAT: Factory: construct Page, delegate to load_bytes.
+    WHY:  Buffer pool and recovery both need "bytes from disk → Page object."
+          A factory keeps that logic in one place instead of duplicating it.
+
+    Tests: test_page_header_round_trip, test_page_round_trip
+
+
+File: storage/file_manager.py
+-----------------------------
+
+[ ] __init__(path)
+    WHAT: os.open(O_RDWR) + mmap.mmap(fd, 0). Store _fd, _mmap, page_size.
+    WHY:  mmap lets the buffer pool access any page by offset without a syscall
+          per read. This is how most embedded engines map the data file into the
+          address space — fast random access at page granularity.
+
+[ ] create(path)
+    WHAT: mkdir parents. Write one zeroed page (page 0 = meta placeholder).
+    WHY:  Page 0 is reserved for database metadata (root pointer, format version).
+          Creating a file with exactly one page establishes a valid empty database
+          with a known starting size — num_pages() == 1 from day one.
+
+[ ] read_page(page_id)
+    WHAT: offset = page_id * page_size. Seek mmap, return page_size bytes.
+    WHY:  Page-addressed I/O is the only interface the buffer pool should use.
+          Hiding mmap details here means you can swap to pread/pwrite later
+          without touching the B+tree or WAL.
+
+[ ] write_page(page_id, data)
+    WHAT: Assert len(data) == page_size. Seek, write at offset.
+    WHY:  Strict length checks catch bugs early. Writing 4095 bytes into a 4096-byte
+          slot would shift every subsequent page and destroy the file.
+    INVARIANT: file size is always a multiple of page_size.
+
+[ ] allocate_page()
+    WHAT: new_id = num_pages(). Resize mmap by one page. Return new_id.
+    WHY:  B+tree splits and new tables need new pages. Growing the file by exactly
+          one page at a time keeps page IDs dense and predictable (0, 1, 2, ...).
+
+[ ] num_pages()
+    WHAT: return len(_mmap) // page_size
+    WHY:  allocate_page and recovery both need to know file extent. This is the
+          single source of truth for "how many pages exist on disk."
+
+[ ] sync()
+    WHAT: mmap.flush() + os.fsync(_fd)
+    WHY:  flush pushes mmap dirty pages to the OS buffer; fsync pushes them to
+          physical media. Without fsync, a power loss after "successful" write can
+          still lose data — the OS is allowed to delay disk I/O.
+
+[ ] close()
+    WHAT: Close mmap and file descriptor.
+    WHY:  Leaking fds prevents deleting/moving the database file and eventually
+          exhausts the process fd table. Always pair open with close.
+
+    Test: test_file_manager_page_io
+
+
+File: storage/buffer_pool.py
+----------------------------
+
+[ ] fetch_page(page_id)
+    WHAT: Cache hit → move_to_end (LRU touch), return page.
+          Cache miss → read_page → Page.from_bytes → _put_page.
+    WHY:  Disk is ~100,000x slower than RAM. The buffer pool exists so repeated
+          access to the same page (common in B+tree traversals) does not hit disk
+          every time. This is the single biggest performance lever in a DB engine.
+
+[ ] new_page()
+    WHAT: allocate_page on disk, create empty Page, add to cache.
+    WHY:  New pages must exist on disk before they can be WAL-logged. Allocating
+          through the buffer pool keeps the cache and file in sync — the page is
+          immediately available to the B+tree without a separate read.
+
+[ ] mark_dirty(page_id)
+    WHAT: Add page_id to self._dirty.
+    WHY:  Not every cached page needs to be written back — only modified ones.
+          Dirty tracking avoids rewriting unchanged pages on flush, which would
+          waste I/O and amplify WAL volume unnecessarily.
+
+[ ] pin(page_id)
+    WHAT: Increment pin count for page_id.
+    WHY:  A B+tree traversal may hold pointers into a page while fetching a child.
+          If that page were evicted mid-traversal, you'd read stale or wrong data.
+          Pinning is how the pool knows "someone is still using this."
+
+[ ] unpin(page_id)
+    WHAT: Decrement pin count; remove dict entry when it hits zero.
+    WHY:  Pins must be released or the pool fills with unpinnable pages and
+          eviction stops working — a classic buffer pool leak bug.
+
+[ ] flush_page(page_id)
+    WHAT: If dirty, write page.to_bytes() to disk, clear dirty bit.
+    WHY:  Dirty pages are the gap between "changed in memory" and "safe on disk."
+          flush_page is the write-back path the WAL eventually forces.
+
+[ ] flush_all()
+    WHAT: Flush every dirty cached page, then file_manager.sync().
+    WHY:  Checkpoint and shutdown need to push all in-memory state to disk.
+          sync() at the end ensures the data file — not just the WAL — is durable.
+
+[ ] _put_page(page_id, page)
+    WHAT: Evict if at capacity, then insert into OrderedDict, move_to_end.
+    WHY:  OrderedDict gives O(1) LRU ordering. _put_page is the single entry
+          point for cache insertion, so eviction policy is enforced consistently.
+
+[ ] _evict_one()
+    WHAT: Evict LRU unpinned page. Flush first if dirty.
+    WHY:  When the pool is full, something must leave. LRU is a reasonable
+          default (recently used pages are likely used again). Flushing before
+          eviction prevents losing dirty data that hasn't been WAL-covered yet.
+    FAIL: RuntimeError if all pages pinned and pool is full.
+
+    Test: test_buffer_pool_caches_pages
+
+
+================================================================================
+PHASE 2 — B+TREE
+Ordered index on pages. Depends on phase 1 buffer pool API.
+
+WHY THIS PHASE: A heap file gives you insertion order; a B+tree gives you lookup
+and range scan in O(log n). Every primary index in Postgres, MySQL InnoDB, and
+SQLite is a B-tree family structure. This is the access method that makes SQL
+useful at scale.
+================================================================================
+
+File: btree/node.py
+-------------------
+
+[ ] node_from_page(page)
+    WHAT: Inspect page.header.page_type. Parse payload into LeafNode or BTreeNode.
+    WHY:  The buffer pool hands you raw pages. The B+tree needs typed nodes.
+          Deserialization is the boundary between "bytes on disk" and "tree logic."
+
+[ ] node_to_page(node, page)
+    WHAT: Set page_type, serialize keys/children/values into page.payload.
+    WHY:  After every mutation, the in-memory node must be written back as bytes
+          before flush. Serialization format choices here determine on-disk compatibility.
+
+    DESIGN NOTE: length-prefixed keys are simple to parse and debug. Optimize
+    for space (Slotted page layout) only after correctness tests pass.
+
+    Test: test_btree_node_serialization
+
+
+File: btree/btree.py
+--------------------
+
+[ ] _find_leaf(key)
+    WHAT: Descend from root. At internal nodes, pick child via separator keys.
+    WHY:  Point queries and inserts both start at a leaf. _find_leaf is the
+          shared search path — implement it once, use it everywhere.
+
+[ ] get(key) → bytes | None
+    WHAT: Find leaf, scan keys for exact match, return value or None.
+    WHY:  This is the fundamental index operation. SELECT with a primary key,
+          JOIN lookups, and uniqueness checks all reduce to get().
+
+[ ] insert(key, value)
+    WHAT: Insert in sorted order. Split on overflow, propagate separators upward.
+    WHY:  Inserts are how data enters the index. Splits are what keep the tree
+          balanced and queries at O(log n) instead of degrading to O(n) like a
+          sorted array that never reorganizes.
+    INVARIANT I6: keys remain sorted in every leaf.
+
+[ ] delete(key) → bool
+    WHAT: Remove from leaf. Merge or redistribute with sibling on underflow.
+    WHY:  DELETE and UPDATE need to remove old keys. Without merge/redistribute,
+          deleted pages leave dead space and the tree becomes unbalanced — wasted
+          I/O on every scan.
+
+[ ] scan(start, end)
+    WHAT: Walk leaf chain via next_leaf pointers. Yield (key, value) in order.
+    WHY:  Range scans power WHERE col > 5, ORDER BY, and sequential table scans
+          via the index. The leaf linked list is what makes B+trees (not B-trees)
+          efficient for sequential I/O — only leaves are chained, not internals.
+
+    Test: test_btree_insert_and_lookup
+
+
+================================================================================
+PHASE 3 — WRITE-AHEAD LOG
+Durability layer. Must be correct before trusting txn commit.
+
+WHY THIS PHASE: Without a WAL, a crash between buffer pool write and disk flush
+loses committed data permanently. The WAL is what makes the "D" in ACID real.
+Postgres would rather write the log twice than lose a committed transaction.
+================================================================================
+
+File: wal/wal.py
+----------------
+
+[ ] LogRecord.encode() / decode()
+    WHAT: Wire format: header (!BII) + payload_len (u32) + payload bytes.
+    WHY:  Recovery replays bytes, not Python objects. A fixed wire format means
+          you can inspect the WAL with hexdump and replay it across versions
+          if the format is stable.
+
+[ ] WriteAheadLog.__init__(path)
+    WHAT: Open O_RDWR|O_CREAT. Set _offset to EOF.
+    WHY:  WAL is append-only — you never rewrite old records. Starting at EOF
+          lets you add records after a crash without truncating history.
+
+[ ] append(record) → lsn
+    WHAT: Encode, os.write, return byte offset before write, advance _offset.
+    WHY:  LSN (Log Sequence Number) orders events for recovery. "Apply record
+          only if LSN > page.lsn" is the core redo rule from ARIES.
+    INVARIANT I3.
+
+[ ] sync()
+    WHAT: os.fsync(_fd)
+    WHY:  append() puts data in the OS buffer, not on disk. fsync is the barrier
+          that makes COMMIT durable. This is the most important syscall in the
+          entire database.
+
+[ ] iter_records()
+    WHAT: Stream decoder with buffering for partial reads across chunk boundaries.
+    WHY:  Recovery scans the entire WAL on startup. Streaming avoids loading a
+          multi-GB log into memory and handles records split across read boundaries.
+
+    Tests: test_wal_record_round_trip, test_wal_append_and_replay
+
+
+File: wal/recovery.py
+---------------------
+
+[ ] recover(wal, buffer_pool)
+    WHAT: For each PAGE_WRITE where record LSN > page.header.lsn, apply payload.
+          Update page LSN. flush_all() at end.
+    WHY:  After crash, data pages on disk may be stale or torn, but the WAL has
+          the truth. Redo replays committed work that never made it to the data
+          file — this is exactly what Postgres does on startup (simplified).
+    INVARIANT I4.
+
+    Test: test_crash_recovery
+
+
+================================================================================
+PHASE 4 — TRANSACTIONS
+Atomicity + isolation on top of WAL and B+tree.
+
+WHY THIS PHASE: A WAL gives durability for single writes. Transactions group
+multiple writes into an atomic unit and let concurrent readers see a consistent
+snapshot. Without this layer, you have a key-value store, not a database.
+================================================================================
+
+File: txn/mvcc.py
+-----------------
+
+[ ] Snapshot.is_visible(creator_txn_id, committed) → bool
+    WHAT: Four-rule predicate from README.md (own writes, no dirty reads, etc.)
+    WHY:  MVCC avoids read locks — readers don't block writers. The visibility
+          predicate is the entire isolation mechanism. Get it wrong and you get
+          dirty reads, phantom reads, or unrepeatable reads.
+    INVARIANT: pure function — no I/O, no global state.
+
+    Test: test_mvcc_visibility
+
+
+File: txn/transaction.py
+------------------------
+
+[ ] begin() → Transaction
+    WHAT: Assign txn_id. Build Snapshot from active txns. Log BEGIN. Store in _active.
+    WHY:  Every statement needs a txn boundary. The snapshot taken at begin() is
+          the reader's point-in-time view — it must not change mid-query even if
+          other txns commit.
+
+[ ] commit(txn)
+    WHAT: Log COMMIT, fsync WAL, mark inactive, remove from _active.
+    WHY:  COMMIT is the durability point for the whole transaction, not individual
+          page writes. fsync here means "all my WAL records are safe" — the client
+          can trust the data survived.
+    INVARIANT I5.
+
+[ ] abort(txn)
+    WHAT: Log ABORT, mark inactive, remove from _active.
+    WHY:  On error, partial work must not become visible. ABORT marks the txn as
+          discarded. In redo-only recovery, uncommitted PAGE_WRITEs are skipped
+          because COMMIT never reached the log.
+
+[ ] log_page_write(txn, page_id, page_bytes) → lsn
+    WHAT: Append PAGE_WRITE record. Add page_id to txn.write_set.
+    WHY:  WAL protocol: log the change before applying it to the data page.
+          write_set lets you track which pages a txn touched for debugging and
+          future undo/checkpoint optimizations.
+
+    Test: test_transaction_lifecycle
+
+
+================================================================================
+PHASE 5 — SQL LAYER
+Compiler front-end. No direct storage access from parser/lexer.
+
+WHY THIS PHASE: Users speak SQL, not B+tree APIs. The SQL layer is a compiler:
+text → AST → plan → execution. Separating it from storage means you can change
+the query language without touching the page format, and vice versa.
+================================================================================
+
+File: sql/lexer.py
+------------------
+
+[ ] lex(sql) → list[Token]
+    WHAT: Tokenize keywords, idents, numbers, strings, symbols. Append EOF.
+    WHY:  Parsers consume tokens, not raw strings. Lexing separates "what are the
+          words" from "what do they mean" — the same split every compiler uses.
+          EOF token lets the parser detect truncated input cleanly.
+
+    Test: test_lexer_tokenizes_keywords
+
+
+File: sql/parser.py
+-------------------
+
+[ ] Parser.parse() + helper methods
+    WHAT: Recursive descent. Build ast.py types. Raise ParseError on bad input.
+    WHY:  The AST is the contract between parsing and planning. A typed AST means
+          the planner never sees raw strings — it sees structured intent (which
+          table, which columns, which predicate). Errors here save bugs downstream.
+
+    Tests: test_parse_create_table, test_parse_select_with_where,
+           test_parse_invalid_sql_raises
+
+
+File: sql/planner.py
+--------------------
+
+[ ] Planner.plan(statement) → Plan
+    WHAT: Rule-based AST → physical plan tree (SeqScan, Filter, Join, DML nodes).
+    WHY:  Execution should not interpret SQL text. Plans describe *how* to get data
+          (scan this table, filter these rows) independent of syntax. This is the
+          boundary that lets EXPLAIN show a plan without running it.
+
+[ ] Planner.explain(plan) → str
+    WHAT: Recursive tree walk, indented node type names.
+    WHY:  EXPLAIN is how you debug slow queries in every real database. Even a
+          simple text dump teaches you what the engine actually does vs what you
+          expected.
+
+    Test: test_planner_builds_seq_scan
+
+
+File: sql/executor.py
+---------------------
+
+[ ] execute(plan)
+    WHAT: If explain_only, return plan text. Else begin txn, run plan, commit/abort.
+    WHY:  The executor is the runtime. Wrapping every statement in a txn means
+          even a single INSERT gets ACID guarantees without the caller knowing
+          about TransactionManager.
+
+[ ] _execute_node(plan_node)
+    WHAT: Dispatch on plan type — SeqScan, Filter, NestedLoopJoin, DML plans.
+    WHY:  Volcano/iterator model: each operator pulls from its children. Adding a
+          new operator (e.g. IndexScan) means adding one dispatch case, not
+          rewriting the whole executor.
+
+[ ] _eval_expr() / _value()
+    WHAT: Resolve Literal and ColumnRef against a row dict. Evaluate = and !=.
+    WHY:  WHERE and JOIN ON both need predicate evaluation. Keeping this separate
+          from _execute_node means filters and joins share one expression engine.
+
+    Test: test_execute_create_and_insert
+
+
+================================================================================
+INTEGRATION
+================================================================================
+
+[ ] test_database_create_and_close
+    WHAT: Database.create() writes a file; close() flushes and releases resources.
+    WHY:  Proves all layers wire together without import cycles or missing init.
+          This is the minimum "does the database boot" test.
+
+[ ] End-to-end CLI smoke test
+    WHAT: init → CREATE TABLE → INSERT → SELECT → EXPLAIN via db-scratch CLI.
+    WHY:  Unit tests per layer don't catch integration bugs (wrong page size
+          passed through, WAL not synced on close, etc.). A full CLI path is
+          what a user — or an interviewer — actually runs.
