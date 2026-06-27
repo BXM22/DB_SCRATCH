@@ -28,17 +28,28 @@ class TransactionManager:
         self._active: dict[int, Transaction] = {}
 
     def begin(self) -> Transaction:
-        # TODO(phase-4): assign txn id, build Snapshot from active txns, log BEGIN
-        raise NotImplementedError
+        txn_id = self._next_txn_id
+        self._next_txn_id += 1
+        snapshot = Snapshot(txn_id, frozenset(self._active.keys()))
+        txn = Transaction(txn_id, snapshot)
+        self._active[txn_id] = txn
+        self.wal.append(LogRecord(LogRecordType.BEGIN, txn_id))
+        return txn
 
     def commit(self, txn: Transaction) -> None:
-        # TODO(phase-4): log COMMIT, fsync wal, mark txn inactive, remove from _active
-        raise NotImplementedError
+        self.wal.append(LogRecord(LogRecordType.COMMIT, txn.txn_id))
+        self.wal.sync()
+        txn.active = False
+        del self._active[txn.txn_id]
 
     def abort(self, txn: Transaction) -> None:
-        # TODO(phase-4): log ABORT, mark txn inactive, remove from _active
-        raise NotImplementedError
+        self.wal.append(LogRecord(LogRecordType.ABORT, txn.txn_id))
+        txn.active = False
+        del self._active[txn.txn_id]
 
     def log_page_write(self, txn: Transaction, page_id: int, page_bytes: bytes) -> int:
-        # TODO(phase-4): append PAGE_WRITE record, add page_id to txn.write_set
-        raise NotImplementedError
+        lsn = self.wal.append(
+            LogRecord(LogRecordType.PAGE_WRITE, txn.txn_id, page_id, page_bytes)
+        )
+        txn.write_set.add(page_id)
+        return lsn

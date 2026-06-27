@@ -68,14 +68,54 @@ class Planner:
     """Translate AST statements into volcano-style plan trees."""
 
     def plan(self, statement: ast.Statement) -> Plan:
-        # TODO(phase-5c): map each AST type to a plan tree
-        #   CREATE  -> CreateTablePlan
-        #   INSERT  -> InsertPlan
-        #   SELECT  -> SeqScan + optional Filter + NestedLoopJoin per JOIN
-        #   UPDATE  -> UpdatePlan wrapping Filter(SeqScan)
-        #   EXPLAIN -> plan inner statement with explain_only=True
-        raise NotImplementedError
+        if isinstance(statement, ast.Explain):
+            inner = self.plan(statement.statement)
+            return Plan(inner.root, explain_only=True)
+        if isinstance(statement, ast.CreateTable):
+            return Plan(CreateTablePlan(statement.table_name, statement.columns))
+        if isinstance(statement, ast.Insert):
+            return Plan(InsertPlan(statement.table_name, statement.columns, statement.values))
+        if isinstance(statement, ast.Select):
+            root: PlanNode = SeqScan(statement.table_name)
+            if statement.where is not None:
+                root = Filter(statement.where, root)
+            for join in statement.joins:
+                right = SeqScan(join.table_name)
+                root = NestedLoopJoin(root, right, join.on)
+            return Plan(root)
+        if isinstance(statement, ast.Update):
+            scan: PlanNode = SeqScan(statement.table_name)
+            if statement.where is not None:
+                scan = Filter(statement.where, scan)
+            return Plan(
+                UpdatePlan(statement.table_name, statement.assignments, statement.where, scan)
+            )
+        raise TypeError(f"unsupported statement type: {type(statement)}")
 
     def explain(self, plan: Plan) -> str:
-        # TODO(phase-5c): walk plan tree, indent by depth, return node type names
-        raise NotImplementedError
+        lines: list[str] = []
+
+        def walk(node: PlanNode, depth: int) -> None:
+            indent = "  " * depth
+            name = type(node).__name__
+            if isinstance(node, SeqScan):
+                lines.append(f"{indent}{name}({node.table_name})")
+            elif isinstance(node, IndexScan):
+                lines.append(f"{indent}{name}({node.table_name}, {node.index_name})")
+            elif isinstance(node, Filter):
+                lines.append(f"{indent}{name}")
+                walk(node.child, depth + 1)
+            elif isinstance(node, NestedLoopJoin):
+                lines.append(f"{indent}{name}")
+                walk(node.left, depth + 1)
+                walk(node.right, depth + 1)
+            elif isinstance(node, InsertPlan):
+                lines.append(f"{indent}{name}({node.table_name})")
+            elif isinstance(node, CreateTablePlan):
+                lines.append(f"{indent}{name}({node.table_name})")
+            elif isinstance(node, UpdatePlan):
+                lines.append(f"{indent}{name}({node.table_name})")
+                walk(node.child, depth + 1)
+
+        walk(plan.root, 0)
+        return "\n".join(lines)

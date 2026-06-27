@@ -16,8 +16,10 @@ class Snapshot:
     active_txns: frozenset[int]
 
     def is_visible(self, creator_txn_id: int, committed: bool) -> bool:
-        # TODO(phase-4): implement snapshot isolation visibility rules
-        #   - your own uncommitted writes are visible
-        #   - uncommitted writes from others are not
-        #   - committed writes from active txns at snapshot time are not
-        raise NotImplementedError
+        if creator_txn_id == self.txn_id:
+            return True
+        if not committed:
+            return False
+        if creator_txn_id in self.active_txns:
+            return False
+        return True

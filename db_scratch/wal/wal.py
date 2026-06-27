@@ -5,6 +5,7 @@ Phase 3 — after B+tree basics.
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
@@ -31,13 +32,26 @@ class LogRecord:
     payload: bytes = b""
 
     def encode(self) -> bytes:
-        # TODO(phase-3): pack header + 4-byte payload length + payload
-        raise NotImplementedError
+        header = struct.pack(
+            LOG_RECORD_HEADER,
+            int(self.record_type),
+            self.txn_id,
+            self.page_id,
+        )
+        return header + struct.pack("!I", len(self.payload)) + self.payload
 
     @classmethod
     def decode(cls, data: bytes) -> LogRecord:
-        # TODO(phase-3): unpack header, read payload length, slice payload
-        raise NotImplementedError
+        min_size = LOG_RECORD_HEADER_SIZE + 4
+        if len(data) < min_size:
+            raise ValueError("truncated log record")
+        record_type, txn_id, page_id = struct.unpack(LOG_RECORD_HEADER, data[:LOG_RECORD_HEADER_SIZE])
+        payload_len = struct.unpack("!I", data[LOG_RECORD_HEADER_SIZE : LOG_RECORD_HEADER_SIZE + 4])[0]
+        end = LOG_RECORD_HEADER_SIZE + 4 + payload_len
+        if len(data) < end:
+            raise ValueError("truncated log record payload")
+        payload = data[LOG_RECORD_HEADER_SIZE + 4 : end]
+        return cls(LogRecordType(record_type), txn_id, page_id, payload)
 
 
 class WriteAheadLog:
@@ -45,22 +59,43 @@ class WriteAheadLog:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        # TODO(phase-3): open/create wal file, track append offset as self._offset
-        raise NotImplementedError
+        self._fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        self._offset = os.lseek(self._fd, 0, os.SEEK_END)
 
     def append(self, record: LogRecord) -> int:
-        # TODO(phase-3): encode record, os.write, return LSN (offset before write)
-        raise NotImplementedError
+        data = record.encode()
+        lsn = self._offset
+        os.write(self._fd, data)
+        self._offset += len(data)
+        return lsn
 
     def sync(self) -> None:
-        # TODO(phase-3): fsync the wal file descriptor
-        raise NotImplementedError
+        os.fsync(self._fd)
 
     def iter_records(self):
-        # TODO(phase-3): read from start of file, yield decoded LogRecords
-        raise NotImplementedError
-        yield  # pragma: no cover
+        fd = os.open(str(self.path), os.O_RDONLY)
+        try:
+            offset = 0
+            buf = b""
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    min_size = LOG_RECORD_HEADER_SIZE + 4
+                    if len(buf) < min_size:
+                        break
+                    payload_len = struct.unpack("!I", buf[LOG_RECORD_HEADER_SIZE : min_size])[0]
+                    total = min_size + payload_len
+                    if len(buf) < total:
+                        break
+                    record = LogRecord.decode(buf[:total])
+                    yield offset, record
+                    offset += total
+                    buf = buf[total:]
+        finally:
+            os.close(fd)
 
     def close(self) -> None:
-        # TODO(phase-3): close file descriptor
-        raise NotImplementedError
+        os.close(self._fd)

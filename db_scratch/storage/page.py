@@ -31,14 +31,29 @@ class PageHeader:
     free_space: int
 
     def pack(self) -> bytes:
-        # TODO(phase-1): use struct.pack with PAGE_HEADER_FORMAT
-        
-        raise NotImplementedError
+        return struct.pack(
+            PAGE_HEADER_FORMAT,
+            int(self.page_type),
+            self.flags,
+            self.page_id,
+            self.lsn,
+            self.free_space,
+        )
 
     @classmethod
     def unpack(cls, data: memoryview) -> PageHeader:
-        # TODO(phase-1): read PAGE_HEADER_SIZE bytes and return a PageHeader
-        raise NotImplementedError
+        if len(data) < PAGE_HEADER_SIZE:
+            raise ValueError("truncated page header")
+        page_type, flags, page_id, lsn, free_space = struct.unpack(
+            PAGE_HEADER_FORMAT, data[:PAGE_HEADER_SIZE]
+        )
+        return cls(
+            page_type=PageType(page_type),
+            flags=flags,
+            page_id=page_id,
+            lsn=lsn,
+            free_space=free_space,
+        )
 
 
 class Page:
@@ -58,15 +73,13 @@ class Page:
 
     @property
     def payload(self) -> memoryview:
-        return memoryview(self._data[PAGE_HEADER_SIZE:])
-    
+        return memoryview(self._data)[PAGE_HEADER_SIZE:]
 
     def to_bytes(self) -> bytes:
         self._data[:PAGE_HEADER_SIZE] = self.header.pack()
         return bytes(self._data)
 
     def load_bytes(self, raw: bytes) -> None:
-        # TODO(phase-1): validate length, copy into _data, refresh header
         if len(raw) != self.page_size:
             raise ValueError("Invalid page size")
         self._data[:] = raw
@@ -74,8 +87,6 @@ class Page:
 
     @classmethod
     def from_bytes(cls, page_id: int, raw: bytes) -> Page:
-        # TODO(phase-1): construct Page and call load_bytes
-        page = cls(page_id)
+        page = cls(page_id, page_size=len(raw))
         page.load_bytes(raw)
         return page
-        

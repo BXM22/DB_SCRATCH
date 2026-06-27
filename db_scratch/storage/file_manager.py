@@ -5,6 +5,8 @@ Phase 1 — after page.py.
 
 from __future__ import annotations
 
+import mmap
+import os
 from pathlib import Path
 
 from db_scratch.storage.page import DEFAULT_PAGE_SIZE
@@ -16,35 +18,41 @@ class FileManager:
     def __init__(self, path: Path, *, page_size: int = DEFAULT_PAGE_SIZE) -> None:
         self.path = path
         self.page_size = page_size
-        # TODO(phase-1): open file with os.open, mmap the file into self._mmap
-        
-        raise NotImplementedError
+        self._fd = os.open(str(path), os.O_RDWR)
+        self._mmap = mmap.mmap(self._fd, 0, access=mmap.ACCESS_WRITE)
 
     @classmethod
     def create(cls, path: Path, *, page_size: int = DEFAULT_PAGE_SIZE) -> FileManager:
-        # TODO(phase-1): create parent dirs, write one zeroed page (meta page 0)
-        raise NotImplementedError
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * page_size)
+        return cls(path, page_size=page_size)
 
     def read_page(self, page_id: int) -> bytes:
-        # TODO(phase-1): seek to page_id * page_size, read exactly page_size bytes
-        raise NotImplementedError
+        offset = page_id * self.page_size
+        return bytes(self._mmap[offset : offset + self.page_size])
 
     def write_page(self, page_id: int, data: bytes) -> None:
-        # TODO(phase-1): validate len(data) == page_size, write at correct offset
-        raise NotImplementedError
+        if len(data) != self.page_size:
+            raise ValueError(f"expected {self.page_size} bytes, got {len(data)}")
+        offset = page_id * self.page_size
+        self._mmap[offset : offset + self.page_size] = data
 
     def allocate_page(self) -> int:
-        # TODO(phase-1): extend mmap, return new page id
-        raise NotImplementedError
+        new_id = self.num_pages()
+        new_size = (new_id + 1) * self.page_size
+        os.ftruncate(self._fd, new_size)
+        self._mmap.close()
+        self._mmap = mmap.mmap(self._fd, 0, access=mmap.ACCESS_WRITE)
+        return new_id
 
     def num_pages(self) -> int:
-        # TODO(phase-1): return len(mmap) // page_size
-        raise NotImplementedError
+        return len(self._mmap) // self.page_size
 
     def sync(self) -> None:
-        # TODO(phase-1): mmap.flush() + os.fsync(fd)
-        raise NotImplementedError
+        self._mmap.flush()
+        os.fsync(self._fd)
 
     def close(self) -> None:
-        # TODO(phase-1): close mmap and file descriptor
-        raise NotImplementedError
+        self._mmap.close()
+        os.close(self._fd)

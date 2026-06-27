@@ -45,6 +45,7 @@ class Database:
         """Flush dirty pages, sync WAL, and close files."""
         self.buffer_pool.flush_all()
         self.wal.sync()
+        self.wal.close()
         self.file_manager.close()
 
     @classmethod

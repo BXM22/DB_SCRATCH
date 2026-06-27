@@ -354,18 +354,88 @@ TODOS.txt          # Implementation checklist with rationale
 
 **Requirements:** Python ≥ 3.11, pip or uv.
 
+### Install
+
+From the repo root:
+
 ```bash
 pip install -e ".[dev]"
-pytest -rs                    # all tests skipped until you implement each phase
 ```
 
-Work through `TODOS.txt` in order. Un-skip tests in `tests/test_smoke.py` as each phase passes.
+### Quick start
+
+From the repo root:
+
+```bash
+./run.sh                  # demo workflow (default)
+./run.sh shell            # interactive SQL shell
+./run.sh --fresh          # wipe demo db and re-run
+./run.sh --test           # run pytest
+```
+
+The wrapper installs dependencies automatically if `typer` is missing.
+
+### CLI
+
+After `pip install -e ".[dev]"`, use `db-scratch` or `python -m db_scratch`:
+
+```bash
+db-scratch --help
+python -m db_scratch --help
+```
+
+| Command | Description |
+|---------|-------------|
+| `init PATH` | Create a new database file |
+| `sql PATH "SQL"` | Run one statement, print results as a table |
+| `explain PATH "SQL"` | Print the query plan |
+| `shell [PATH]` | Interactive SQL REPL — type SQL here (`.help`, `.demo`, `.quit`) |
+| `demo [--db PATH] [--fresh]` | Run sample CREATE / INSERT / SELECT / EXPLAIN |
+| `test` | Run the pytest suite |
+
+**Examples:**
 
 ```bash
 db-scratch init ./data/app.db
 db-scratch sql ./data/app.db "CREATE TABLE users (id INT, name TEXT)"
+db-scratch sql ./data/app.db "INSERT INTO users (id, name) VALUES (1, 'alice')"
+db-scratch sql ./data/app.db "SELECT id, name FROM users"
 db-scratch explain ./data/app.db "SELECT id FROM users WHERE id = 1"
+db-scratch shell ./data/app.db
+db-scratch demo --fresh
 ```
+
+Each database uses a `.db` file (data pages) and a `.wal` file (write-ahead log) alongside it.
+
+Set a default path for `shell` / `demo` with `DB_PATH`:
+
+```bash
+DB_PATH=/tmp/my.db db-scratch shell
+```
+
+### Run tests
+
+```bash
+pytest -v
+db-scratch test
+./run.sh --test
+```
+
+### Python API
+
+```python
+from pathlib import Path
+from db_scratch.database import Database
+
+db = Database.create(Path("./data/app.db"))
+db.execute("CREATE TABLE users (id INT, name TEXT)")
+db.execute("INSERT INTO users (id, name) VALUES (1, 'alice')")
+rows = db.execute("SELECT id, name FROM users")
+print(rows)  # [{'id': 1, 'name': 'alice'}]
+db.close()
+```
+
+Open an existing database with `Database(path)` instead of `Database.create(path)`.
 
 ---
 
